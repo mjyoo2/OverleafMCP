@@ -1,16 +1,18 @@
-const { exec } = require('child_process');
-const fs = require('fs').promises;
-const path = require('path');
-const { promisify } = require('util');
+import { exec } from 'child_process';
+import fs from 'fs/promises';
+import path from 'path';
+import { promisify } from 'util';
+import os from 'os';
 const execAsync = promisify(exec);
 
 class OverleafGitClient {
-    constructor(gitToken, projectId, tempDir = './temp') {
+    constructor(gitToken, projectId, tempDir = null) {
         this.gitToken = gitToken;
         this.projectId = projectId;
-        this.tempDir = tempDir;
+        // Use OS temp directory as default, with overleaf-mcp subdirectory
+        this.tempDir = tempDir || path.join(os.tmpdir(), 'overleaf-mcp');
         this.repoUrl = `https://git:${gitToken}@git.overleaf.com/${projectId}`;
-        this.localPath = path.join(tempDir, projectId);
+        this.localPath = path.join(this.tempDir, projectId);
     }
 
     async cloneOrPull() {
@@ -20,7 +22,14 @@ class OverleafGitClient {
                 env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }
             });
         } catch {
-            await fs.mkdir(this.tempDir, { recursive: true });
+            try {
+                await fs.mkdir(this.tempDir, { recursive: true });
+            } catch (mkdirError) {
+                // If mkdir fails, try to create parent directories
+                const parentDir = path.dirname(this.tempDir);
+                await fs.mkdir(parentDir, { recursive: true });
+                await fs.mkdir(this.tempDir, { recursive: true });
+            }
             await execAsync(`git clone "${this.repoUrl}" "${this.localPath}"`, {
                 env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }
             });
@@ -100,4 +109,4 @@ class OverleafGitClient {
     }
 }
 
-module.exports = OverleafGitClient;
+export default OverleafGitClient;

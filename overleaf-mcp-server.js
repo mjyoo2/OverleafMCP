@@ -1,6 +1,15 @@
 // Load project configuration
-const fs = require('fs');
-const path = require('path');
+// const fs = require('fs');
+// const path = require('path');
+
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+
+// ES module equivalent of __dirname
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 let projectsConfig = {};
 try {
   const projectsFile = fs.readFileSync(path.join(__dirname, 'projects.json'), 'utf8');
@@ -8,13 +17,14 @@ try {
 } catch (err) {
   // Ignore if projects.json file doesn't exist
 }
-const { Server } = require('@modelcontextprotocol/sdk/server/index.js');
-const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');
-const {
+
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
-} = require('@modelcontextprotocol/sdk/types.js');
-const OverleafGitClient = require('./overleaf-git-client.js');
+} from '@modelcontextprotocol/sdk/types.js';
+import OverleafGitClient from './overleaf-git-client.js';
 
 const server = new Server(
   {
