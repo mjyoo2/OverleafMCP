@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/mjyoo2-overleafmcp-badge.png)](https://mseep.ai/app/mjyoo2-overleafmcp)
+
 # Overleaf MCP Server
 
 An MCP (Model Context Protocol) server that provides access to Overleaf projects via Git integration. This allows Claude and other MCP clients to read LaTeX files, analyze document structure, extract content, and write files from and to Overleaf projects.
