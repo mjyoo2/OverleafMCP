@@ -311,8 +311,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'status_summary': {
         const client = getProject(args.projectName);
+        const projectConfig = projectsConfig.projects[args.projectName || 'default'];
         const files = await client.listFiles();
-        const mainFile = files.find(f => f.includes('main.tex')) || files[0];
+        const mainFile = (projectConfig?.mainFile && files.includes(projectConfig.mainFile) && projectConfig.mainFile)
+          || files.find(f => f.includes('main.tex'))
+          || files[0];
         let sections = [];
         
         if (mainFile) {
