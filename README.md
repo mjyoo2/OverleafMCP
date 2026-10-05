@@ -8,6 +8,7 @@ An MCP (Model Context Protocol) server that provides access to Overleaf projects
 - 📋 **Document Structure**: Parse LaTeX sections and subsections
 - 🔍 **Content Extraction**: Extract specific sections by title
 - 📊 **Project Summary**: Get overview of project status and structure
+- 💬 **Review Comments**: Read comment threads in full, with the file and line each is anchored to (needs a session cookie)
 - 🏗️ **Multi-Project Support**: Manage multiple Overleaf projects
 
 ## Quick Start (recommended)
@@ -131,6 +132,17 @@ The server picks the **first** matching configuration source:
 
 When env vars are set and a file is also present, env vars win and a notice is logged to stderr so the shadowing is visible.
 
+### Session cookie (optional, for `get_comments`)
+
+Review comments are not part of Overleaf's Git bridge, so a Git token cannot read them. `get_comments` reads them the way the Overleaf editor does, through the web app, and needs your logged-in browser session:
+
+- `OVERLEAF_SESSION_COOKIE` — the value of the `overleaf_session2` cookie (a bare value or the full `overleaf_session2=...` pair), or
+- `OVERLEAF_SESSION_COOKIE_FILE=/path/to/cookie.txt` — the same, read from a file, or
+- `"sessionCookie"` on a project in `projects.json`, which overrides the env var for that project.
+- `OVERLEAF_BASE_URL` (or `"baseUrl"` per project) — for a self-hosted Overleaf; defaults to `https://www.overleaf.com`.
+
+To get the cookie: open your project on overleaf.com, open the browser's developer tools → Application (Chrome) or Storage (Firefox) → Cookies → `https://www.overleaf.com`, and copy the value of `overleaf_session2`. It lasts as long as that browser session; when it expires, `get_comments` says so and you copy a fresh one. Every other tool keeps working without it.
+
 ### `projects.json` schema (multi-project)
 
 ```json
@@ -139,7 +151,8 @@ When env vars are set and a file is also present, env vars win and a notice is l
     "default": {
       "name": "Main Paper",
       "projectId": "...",
-      "gitToken": "olp_..."
+      "gitToken": "olp_...",
+      "sessionCookie": "s%3A... (optional, for get_comments)"
     },
     "paper2": {
       "name": "Second Paper",
@@ -263,6 +276,13 @@ Get content of a specific section.
 Get a comprehensive project status summary.
 - `projectName`: Project identifier (optional)
 
+### `get_comments`
+Read the project's review comments. Returns one entry per thread, with the file and line it is anchored to, the highlighted text, whether it is resolved, and every message in full (author, timestamp, text). Threads whose highlighted text has been deleted are returned with `file: null`. Requires a [session cookie](#session-cookie-optional-for-get_comments).
+- `projectName`: Project identifier (optional)
+- `includeResolved`: Also return resolved threads (optional, default `false`)
+
+The file and line come from matching the highlighted text against the Git checkout (`locationExact: true` when it matches at the recorded offset). The endpoints used, `/project/:id/threads` and `/project/:id/ranges`, are the ones the Overleaf editor's review panel calls. They are internal to Overleaf, not a published API, and may change.
+
 ### `write_file`
 Write the full content of a file to the project.
 - `filePath`: Path to the file (required)
@@ -296,6 +316,9 @@ Use get_section_content with filePath: "main.tex" and sectionTitle: "Introductio
 # List all sections in a file
 Use get_sections with filePath: "main.tex"
 
+# Read all open review comments, in full
+Use get_comments
+
 # Write the full content of a file to the project
 Use write_file with filePath: "main.tex", content: "...", commitMessage: "..."
 
@@ -308,6 +331,7 @@ Use write_section with filePath: "main.tex", sectionTitle: "Introduction", newCo
 - The Overleaf Git token grants full read/write access to your project — treat it like a password.
 - Prefer `OVERLEAF_GIT_TOKEN_FILE` over inlining the token in the Claude Desktop JSON if your config file is backed up or synced.
 - `projects.json` is `.gitignore`d in this repo. Never commit real project IDs or Git tokens.
+- The session cookie used by `get_comments` is a login credential for your whole Overleaf account, not just one project, and is more powerful than a Git token. Keep it in `OVERLEAF_SESSION_COOKIE_FILE` or `projects.json` rather than a synced config, and log out of that browser session to revoke it. The server masks it in error messages.
 - File paths supplied through MCP tool calls are restricted to the cloned project directory; `..` traversal and absolute paths are rejected.
 
 ## License

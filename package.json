@@ -9,11 +9,13 @@
   },
   "files": [
     "overleaf-mcp-server.js",
+    "overleaf-comments.js",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "start": "node overleaf-mcp-server.js"
+    "start": "node overleaf-mcp-server.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"

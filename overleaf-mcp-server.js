@@ -13,6 +13,13 @@ import { exec as execCallback, execFile as execFileCallback } from 'child_proces
 import path from 'path';
 import { fileURLToPath } from 'url';
 import os from 'os';
+import {
+  DEFAULT_BASE_URL,
+  normalizeSessionCookie,
+  maskSessionCookie,
+  fetchComments,
+  buildComments,
+} from './overleaf-comments.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -22,7 +29,7 @@ const execFileP = promisify(execFileCallback);
 
 // Strip the Overleaf git token from any string that may leak into errors/output
 const maskToken = (s) =>
-  String(s ?? '').replace(/https:\/\/git:[^@\s]+@/g, 'https://git:***@');
+  maskSessionCookie(String(s ?? '').replace(/https:\/\/git:[^@\s]+@/g, 'https://git:***@'));
 
 // Pure parser for LaTeX sectioning commands. Brace-balanced so titles with
 // nested macros (e.g. \section{Use of \emph{X}}) are captured correctly.
@@ -92,6 +99,24 @@ async function readEnvToken() {
     } catch (err) {
       console.error(
         `[overleaf-mcp] OVERLEAF_GIT_TOKEN_FILE="${tokenFile}" could not be read: ${err.message}`
+      );
+    }
+  }
+  return null;
+}
+
+// Optional session cookie for get_comments. Comments are not reachable through
+// the Git bridge, only through the web app with a logged-in session.
+async function readEnvSessionCookie() {
+  const direct = process.env.OVERLEAF_SESSION_COOKIE?.trim();
+  if (direct) return direct;
+  const cookieFile = process.env.OVERLEAF_SESSION_COOKIE_FILE?.trim();
+  if (cookieFile) {
+    try {
+      return (await readFile(cookieFile, 'utf-8')).trim();
+    } catch (err) {
+      console.error(
+        `[overleaf-mcp] OVERLEAF_SESSION_COOKIE_FILE="${cookieFile}" could not be read: ${err.message}`
       );
     }
   }
@@ -222,6 +247,18 @@ async function loadProjectsConfig() {
 
 const projectsConfig = await loadProjectsConfig();
 
+// A session cookie given in the environment applies to every project that
+// does not set its own, so multi-project setups need only one login.
+{
+  const envCookie = await readEnvSessionCookie();
+  for (const project of Object.values(projectsConfig.projects)) {
+    if (!project.sessionCookie && envCookie) project.sessionCookie = envCookie;
+    if (!project.baseUrl && process.env.OVERLEAF_BASE_URL?.trim()) {
+      project.baseUrl = process.env.OVERLEAF_BASE_URL.trim();
+    }
+  }
+}
+
 // Git operations helper
 class OverleafGitClient {
   constructor(projectId, gitToken) {
@@ -280,6 +317,17 @@ class OverleafGitClient {
     };
     await walk(this.repoPath);
     return results;
+  }
+
+  // Every text file in the checkout, for locating comment anchors.
+  async readAllTextFiles() {
+    const paths = await this.listFiles('');
+    const files = [];
+    for (const p of paths) {
+      if (!/\.(tex|bib|sty|cls|bbl|txt|md|Rnw|Rtex)$/i.test(p)) continue;
+      files.push({ path: p, content: await readFile(this.resolveSafePath(p), 'utf-8') });
+    }
+    return files;
   }
 
   async readFile(filePath) {
@@ -512,6 +560,26 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: 'get_comments',
+        description:
+          'Read the review comments of an Overleaf project: for each thread, the file and line it is anchored to, ' +
+          'the highlighted text, and every message in full (author, time, text). Needs an Overleaf session cookie ' +
+          '(OVERLEAF_SESSION_COOKIE or "sessionCookie" in projects.json), because comments are not part of the Git bridge.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            projectName: {
+              type: 'string',
+              description: 'Project identifier (optional)',
+            },
+            includeResolved: {
+              type: 'boolean',
+              description: 'Also return resolved threads (default false)',
+            },
+          },
+        },
+      },
+      {
         name: 'write_file',
         description: 'Write content to a file in an Overleaf project and push to Overleaf',
         inputSchema: {
@@ -665,6 +733,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
                 totalSections: sections.length,
                 files: files.slice(0, 10),
               }, null, 2),
+            },
+          ],
+        };
+      }
+
+      case 'get_comments': {
+        const project = projectsConfig.projects[args?.projectName || 'default'];
+        if (!project) {
+          throw new Error(`Project "${args?.projectName}" not found in configuration`);
+        }
+        const cookie = normalizeSessionCookie(project.sessionCookie);
+        // Fetch first: it fails fast on a missing or expired cookie, before any clone.
+        const { threads, ranges } = await fetchComments({
+          baseUrl: project.baseUrl || DEFAULT_BASE_URL,
+          projectId: project.projectId,
+          cookie,
+        });
+        const files = await getProject(args?.projectName).readAllTextFiles();
+        const comments = buildComments(threads, ranges, files, {
+          includeResolved: Boolean(args?.includeResolved),
+        });
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(comments, null, 2),
             },
           ],
         };
