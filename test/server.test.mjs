@@ -23,9 +23,9 @@ function fixture(extra = {}) {
 }
 
 // Spawn the server, run initialize + one tools/call, return { result, stderr }.
-function callTool(env, name, args = {}) {
+function callTool(env, name, args = {}, nodeArgs = []) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [SERVER], {
+    const child = spawn(process.execPath, [...nodeArgs, SERVER], {
       env: { PATH: process.env.PATH, HOME: process.env.HOME, ...env },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
@@ -107,4 +107,33 @@ test('an invalid cookie reports expiry and never echoes the cookie', { skip: pro
   assert.equal(result.isError, true);
   assert.match(text(result), /Overleaf session cookie expired — copy a fresh overleaf_session2 from your browser/);
   assert.doesNotMatch(text(result) + stderr, new RegExp(secret));
+});
+
+test('sync adds only missing projects, renames ID placeholders, keeps file mode 600', async () => {
+  const placeholder = 'bbbbbbbbbbbbbbbbbbbbbbbb';
+  const { file } = fixture({ sessionCookie: 'stub' });
+  const cfg = JSON.parse(readFileSync(file, 'utf8'));
+  cfg.projects.paper.name = 'My own name';
+  cfg.projects[placeholder] = { name: placeholder, projectId: placeholder, gitToken: 'olp_fake' };
+  writeFileSync(file, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 });
+  const remote = [
+    { _id: 'aaaaaaaaaaaaaaaaaaaaaaaa', name: 'Remote name', accessLevel: 'owner' },
+    { _id: placeholder, name: 'Real B', accessLevel: 'readAndWrite' },
+    { _id: 'cccccccccccccccccccccccc', name: 'New C', accessLevel: 'owner' },
+  ];
+  const stub = path.join(path.dirname(SERVER), 'test', 'fetch-stub.mjs');
+  const { result } = await callTool(
+    { OVERLEAF_PROJECTS_CONFIG: file, STUB_PROJECTS: JSON.stringify(remote) },
+    'list_overleaf_projects', { sync: true }, ['--import', stub]
+  );
+  assert.equal(result.isError, undefined, text(result));
+  const out = JSON.parse(text(result));
+  assert.deepEqual([out.added, out.renamed], [1, 1]);
+  assert.deepEqual(out.projects.map((p) => p.configuredAs), ['paper', placeholder, 'cccccccccccccccccccccccc']);
+  const saved = JSON.parse(readFileSync(file, 'utf8'));
+  assert.equal(saved.projects.paper.name, 'My own name');
+  assert.equal(saved.projects[placeholder].name, 'Real B');
+  assert.deepEqual(saved.projects.cccccccccccccccccccccccc, { name: 'New C', projectId: 'cccccccccccccccccccccccc', gitToken: 'olp_fake' });
+  assert.equal(saved.sessionCookie, 'stub');
+  assert.equal(statSync(file).mode & 0o777, 0o600);
 });
