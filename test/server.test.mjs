@@ -137,3 +137,54 @@ test('sync adds only missing projects, renames ID placeholders, keeps file mode 
   assert.equal(saved.sessionCookie, 'stub');
   assert.equal(statSync(file).mode & 0o777, 0o600);
 });
+
+const STUB = path.join(path.dirname(SERVER), 'test', 'fetch-stub.mjs');
+const REMOTE = [
+  { _id: 'aaaaaaaaaaaaaaaaaaaaaaaa', name: 'Paper', accessLevel: 'owner' },
+  { _id: 'cccccccccccccccccccccccc', name: 'Shared C', accessLevel: 'readWrite' },
+];
+
+test('listing without sync reads the cookie file, reports configuredAs, writes nothing', async () => {
+  const { dir, file } = fixture();
+  const cookieFile = path.join(dir, 'cookie');
+  const seen = path.join(dir, 'seen');
+  writeFileSync(cookieFile, 'overleaf_session2=s3cret\n', { mode: 0o600 });
+  const before = readFileSync(file, 'utf8');
+  const { result, stderr } = await callTool(
+    { OVERLEAF_PROJECTS_CONFIG: file, OVERLEAF_SESSION_COOKIE_FILE: cookieFile, STUB_PROJECTS: JSON.stringify(REMOTE), STUB_SEEN: seen },
+    'list_overleaf_projects', {}, ['--import', STUB]
+  );
+  assert.equal(result.isError, undefined, text(result));
+  assert.equal(readFileSync(seen, 'utf8'), 'overleaf_session2=s3cret'); // prefix and newline stripped, not doubled
+  assert.deepEqual(JSON.parse(text(result)), {
+    projects: [
+      { projectId: 'aaaaaaaaaaaaaaaaaaaaaaaa', name: 'Paper', accessLevel: 'owner', configuredAs: 'paper' },
+      { projectId: 'cccccccccccccccccccccccc', name: 'Shared C', accessLevel: 'readWrite', configuredAs: null },
+    ],
+  });
+  assert.equal(readFileSync(file, 'utf8'), before);
+  assert.doesNotMatch(text(result) + stderr, /s3cret/);
+});
+
+test('a second sync is a no-op and leaves the file byte-identical', async () => {
+  const { file } = fixture({ sessionCookie: 'stub' });
+  const env = { OVERLEAF_PROJECTS_CONFIG: file, STUB_PROJECTS: JSON.stringify(REMOTE) };
+  await callTool(env, 'list_overleaf_projects', { sync: true }, ['--import', STUB]);
+  const after1 = readFileSync(file, 'utf8');
+  const { result } = await callTool(env, 'list_overleaf_projects', { sync: true }, ['--import', STUB]);
+  const out = JSON.parse(text(result));
+  assert.deepEqual([out.added, out.renamed], [0, 0]);
+  assert.equal(readFileSync(file, 'utf8'), after1);
+});
+
+for (const [label, stubEnv] of [['a redirect to /login', { STUB_STATUS: '302' }], ['an HTML page', { STUB_HTML: '1' }]]) {
+  test(`${label} is reported as an expired cookie and nothing is written`, async () => {
+    const { file } = fixture({ sessionCookie: 'stale-cookie-123' });
+    const before = readFileSync(file, 'utf8');
+    const { result, stderr } = await callTool({ OVERLEAF_PROJECTS_CONFIG: file, ...stubEnv }, 'list_overleaf_projects', { sync: true }, ['--import', STUB]);
+    assert.equal(result.isError, true);
+    assert.match(text(result), /Overleaf session cookie expired/);
+    assert.doesNotMatch(text(result) + stderr, /stale-cookie-123/);
+    assert.equal(readFileSync(file, 'utf8'), before);
+  });
+}
