@@ -7,7 +7,7 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { spawn } from 'child_process';
-import { readFile, writeFile, access, readdir } from 'fs/promises';
+import { readFile, writeFile, access, readdir, chmod, rename } from 'fs/promises';
 import { promisify } from 'util';
 import { exec as execCallback, execFile as execFileCallback } from 'child_process';
 import path from 'path';
@@ -153,6 +153,9 @@ function validateConfigShape(data, sourceLabel) {
   return data;
 }
 
+// Path of the projects.json the config was loaded from; null in env-var mode (nothing to write back).
+let configPath = null;
+
 async function loadProjectsConfig() {
   // 1. Env-var single-project mode wins outright.
   const envId = process.env.OVERLEAF_PROJECT_ID?.trim();
@@ -190,6 +193,7 @@ async function loadProjectsConfig() {
   if (process.env.OVERLEAF_PROJECTS_CONFIG) {
     const p = process.env.OVERLEAF_PROJECTS_CONFIG;
     const data = await loadExplicitConfigOrExit(p, 'OVERLEAF_PROJECTS_CONFIG');
+    configPath = p;
     return validateConfigShape(data, `OVERLEAF_PROJECTS_CONFIG (${p})`);
   }
 
@@ -201,7 +205,10 @@ async function loadProjectsConfig() {
   ];
   for (const c of fallbackCandidates) {
     const data = await tryLoadFile(c.path);
-    if (data) return validateConfigShape(data, `${c.label} (${c.path})`);
+    if (data) {
+      configPath = c.path;
+      return validateConfigShape(data, `${c.label} (${c.path})`);
+    }
   }
 
   // 4. Nothing found — print actionable help and exit.
@@ -402,14 +409,136 @@ const server = new Server(
   }
 );
 
+// Atomic, private write-back of the loaded config: a failed write can't corrupt it.
+async function saveConfig() {
+  const tmp = `${configPath}.tmp`;
+  await writeFile(tmp, JSON.stringify(projectsConfig, null, 2) + '\n', { mode: 0o600 });
+  await chmod(tmp, 0o600); // mode above only applies when tmp is newly created
+  await rename(tmp, configPath);
+}
+
+// Git tokens are account-wide, so any configured project's token works for the account.
+function accountToken() {
+  return Object.values(projectsConfig.projects).find((p) => p.gitToken)?.gitToken;
+}
+
+// Adopt a raw Overleaf project ID (from overleaf.com/project/<id>) that isn't configured yet.
+async function adoptProjectId(id) {
+  if (!/^[0-9a-f]{24}$/.test(id)) return null;
+  const gitToken = accountToken();
+  if (!gitToken) return null;
+  try {
+    await execFileP('git', ['ls-remote', `https://git:${gitToken}@git.overleaf.com/${id}`], {
+      timeout: 30000,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    });
+  } catch {
+    // Fixed text on purpose: git's stderr carries the token URL.
+    throw new Error(`Overleaf project "${id}" is not reachable with the configured git token`);
+  }
+  const project = { name: id, projectId: id, gitToken };
+  projectsConfig.projects[id] = project;
+  if (configPath) await saveConfig();
+  return project;
+}
+
+// ---------------------------------------------------------------------------
+// Account project listing via the Overleaf web session (git can't list projects).
+// Uses GET /user/projects — the route Overleaf's own frontend calls; it returns
+// active projects only ({ _id, name, accessLevel }), archived/trashed filtered server-side.
+// ---------------------------------------------------------------------------
+
+const COOKIE_EXPIRED = 'Overleaf session cookie expired — copy a fresh overleaf_session2 from your browser';
+
+async function readSessionCookie() {
+  let v = process.env.OVERLEAF_SESSION_COOKIE;
+  if (!v && process.env.OVERLEAF_SESSION_COOKIE_FILE) {
+    try {
+      v = await readFile(process.env.OVERLEAF_SESSION_COOKIE_FILE, 'utf-8');
+    } catch {
+      v = null; // unreadable file → treated as "no cookie"
+    }
+  }
+  v = v || projectsConfig.sessionCookie;
+  return v?.trim().replace(/^overleaf_session2=/, '') || null;
+}
+
+async function fetchAccountProjects(cookie) {
+  const res = await fetch('https://www.overleaf.com/user/projects', {
+    headers: { Cookie: `overleaf_session2=${cookie}`, Accept: 'application/json' },
+    redirect: 'manual', // a followed redirect lands on the /login HTML and hides the cause
+  });
+  if ((res.status >= 300 && res.status < 400) || res.status === 401 || res.status === 403) {
+    throw new Error(COOKIE_EXPIRED);
+  }
+  if (!res.ok) throw new Error(`Overleaf project list request failed (HTTP ${res.status})`);
+  let body;
+  try {
+    body = await res.json();
+  } catch {
+    throw new Error(COOKIE_EXPIRED); // HTML instead of JSON: not logged in
+  }
+  if (!Array.isArray(body?.projects)) throw new Error('Unexpected response from Overleaf /user/projects');
+  return body.projects;
+}
+
+async function listOverleafProjects({ sync = false } = {}) {
+  const cookie = await readSessionCookie();
+  if (!cookie) {
+    throw new Error(
+      'No Overleaf session cookie configured. Set OVERLEAF_SESSION_COOKIE (or OVERLEAF_SESSION_COOKIE_FILE, ' +
+        'or a top-level "sessionCookie" in projects.json) to the value of the overleaf_session2 cookie ' +
+        'from a logged-in browser (dev tools → Application → Cookies → www.overleaf.com).'
+    );
+  }
+  let remote;
+  try {
+    remote = await fetchAccountProjects(cookie);
+  } catch (err) {
+    throw new Error(String(err.message).split(cookie).join('***'));
+  }
+  const configured = Object.entries(projectsConfig.projects);
+  const rows = remote.map((p) => ({
+    projectId: p._id,
+    name: p.name,
+    accessLevel: p.accessLevel,
+    configuredAs: configured.find(([, c]) => c.projectId === p._id)?.[0] ?? null,
+  }));
+  if (!sync) return { projects: rows };
+
+  const gitToken = accountToken();
+  if (!gitToken) throw new Error('sync needs at least one configured project with a gitToken');
+  let added = 0;
+  let renamed = 0;
+  for (const row of rows) {
+    if (!row.configuredAs) {
+      projectsConfig.projects[row.projectId] = { name: row.name, projectId: row.projectId, gitToken };
+      row.configuredAs = row.projectId;
+      added++;
+    } else {
+      const entry = projectsConfig.projects[row.configuredAs];
+      if (entry.name === entry.projectId) { // placeholder left by adoptProjectId
+        entry.name = row.name;
+        renamed++;
+      }
+    }
+  }
+  if ((added || renamed) && configPath) await saveConfig();
+  return { projects: rows, added, renamed };
+}
+
 // Helper to get project
-function getProject(projectName = 'default') {
-  const project = projectsConfig.projects[projectName];
+async function getProject(projectName = 'default') {
+  const project = projectsConfig.projects[projectName] || (await adoptProjectId(projectName));
   if (!project) {
     throw new Error(`Project "${projectName}" not found in configuration`);
   }
   return new OverleafGitClient(project.projectId, project.gitToken);
 }
+
+const PROJECT_NAME_DESCRIPTION =
+  'Project key from list_projects, or any Overleaf project ID (24 hex chars from the project URL); ' +
+  'unknown IDs are verified and added to projects.json (optional, defaults to "default")';
 
 // List all projects
 server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -424,6 +553,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: 'list_overleaf_projects',
+        description:
+          'List all active projects in the Overleaf account (ID, name, access level, and the projects.json ' +
+          'key if configured). Needs an Overleaf session cookie (OVERLEAF_SESSION_COOKIE). ' +
+          'With sync: true, adds missing projects to projects.json under their real names.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            sync: {
+              type: 'boolean',
+              description: 'Add missing projects to projects.json and replace ID placeholder names (optional)',
+            },
+          },
+        },
+      },
+      {
         name: 'list_files',
         description: 'List files in an Overleaf project',
         inputSchema: {
@@ -431,7 +576,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             projectName: {
               type: 'string',
-              description: 'Project identifier (optional, defaults to "default")',
+              description: PROJECT_NAME_DESCRIPTION,
             },
             extension: {
               type: 'string',
@@ -452,7 +597,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             projectName: {
               type: 'string',
-              description: 'Project identifier (optional)',
+              description: PROJECT_NAME_DESCRIPTION,
             },
           },
           required: ['filePath'],
@@ -470,7 +615,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             projectName: {
               type: 'string',
-              description: 'Project identifier (optional)',
+              description: PROJECT_NAME_DESCRIPTION,
             },
           },
           required: ['filePath'],
@@ -492,7 +637,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             projectName: {
               type: 'string',
-              description: 'Project identifier (optional)',
+              description: PROJECT_NAME_DESCRIPTION,
             },
           },
           required: ['filePath', 'sectionTitle'],
@@ -506,7 +651,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             projectName: {
               type: 'string',
-              description: 'Project identifier (optional)',
+              description: PROJECT_NAME_DESCRIPTION,
             },
           },
         },
@@ -531,7 +676,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             projectName: {
               type: 'string',
-              description: 'Project identifier (optional)',
+              description: PROJECT_NAME_DESCRIPTION,
             },
           },
           required: ['filePath', 'content', 'commitMessage'],
@@ -561,7 +706,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             projectName: {
               type: 'string',
-              description: 'Project identifier (optional)',
+              description: PROJECT_NAME_DESCRIPTION,
             },
           },
           required: ['filePath', 'sectionTitle', 'newContent', 'commitMessage'],
@@ -593,8 +738,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case 'list_overleaf_projects': {
+        const result = await listOverleafProjects(args);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+      }
+
       case 'list_files': {
-        const client = getProject(args.projectName);
+        const client = await getProject(args.projectName);
         const files = await client.listFiles(args.extension || '.tex');
         return {
           content: [
@@ -607,7 +757,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'read_file': {
-        const client = getProject(args.projectName);
+        const client = await getProject(args.projectName);
         const content = await client.readFile(args.filePath);
         return {
           content: [
@@ -620,7 +770,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_sections': {
-        const client = getProject(args.projectName);
+        const client = await getProject(args.projectName);
         const sections = await client.getSections(args.filePath);
         return {
           content: [
@@ -633,7 +783,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_section_content': {
-        const client = getProject(args.projectName);
+        const client = await getProject(args.projectName);
         const content = await client.getSectionContent(args.filePath, args.sectionTitle);
         return {
           content: [
@@ -646,7 +796,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'status_summary': {
-        const client = getProject(args.projectName);
+        const client = await getProject(args.projectName);
         const files = await client.listFiles();
         const mainFile = files.find(f => f.includes('main.tex')) || files[0];
         let sections = [];
@@ -671,7 +821,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'write_file': {
-        const client = getProject(args.projectName);
+        const client = await getProject(args.projectName);
         const result = await client.writeFile(args.filePath, args.content, args.commitMessage);
         return {
           content: [
@@ -684,7 +834,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'write_section': {
-        const client = getProject(args.projectName);
+        const client = await getProject(args.projectName);
         const result = await client.writeSection(
           args.filePath,
           args.sectionTitle,

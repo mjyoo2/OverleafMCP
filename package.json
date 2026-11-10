@@ -13,7 +13,8 @@
     "LICENSE"
   ],
   "scripts": {
-    "start": "node overleaf-mcp-server.js"
+    "start": "node overleaf-mcp-server.js",
+    "test": "node --test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0"
