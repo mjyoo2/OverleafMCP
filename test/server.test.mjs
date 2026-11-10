@@ -92,3 +92,19 @@ test('list_projects lists configured keys', async () => {
   const { result } = await callTool({ OVERLEAF_PROJECTS_CONFIG: file }, 'list_projects');
   assert.deepEqual(JSON.parse(text(result)).map((p) => p.id), ['paper']);
 });
+
+test('list_overleaf_projects without a cookie explains how to add one', async () => {
+  const { file } = fixture();
+  const { result } = await callTool({ OVERLEAF_PROJECTS_CONFIG: file }, 'list_overleaf_projects');
+  assert.equal(result.isError, true);
+  assert.match(text(result), /No Overleaf session cookie configured.*OVERLEAF_SESSION_COOKIE/s);
+});
+
+test('an invalid cookie reports expiry and never echoes the cookie', { skip: process.env.OFFLINE === '1' }, async () => {
+  const secret = 'bogus-secret-xyz';
+  const { file } = fixture({ sessionCookie: `overleaf_session2=${secret}` });
+  const { result, stderr } = await callTool({ OVERLEAF_PROJECTS_CONFIG: file }, 'list_overleaf_projects', { sync: true });
+  assert.equal(result.isError, true);
+  assert.match(text(result), /Overleaf session cookie expired — copy a fresh overleaf_session2 from your browser/);
+  assert.doesNotMatch(text(result) + stderr, new RegExp(secret));
+});

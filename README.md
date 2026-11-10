@@ -125,6 +125,25 @@ Use list_files with projectName: "6ac22c59a060ff84e1bdb3fd"
 
 In env-var mode (`OVERLEAF_PROJECT_ID` set) the project is kept in memory only; nothing is written to disk. Note that the server rewrites `projects.json` when it adopts a project, so hand edits made while it runs may be overwritten. Edit the file with the server stopped.
 
+### Listing all your Overleaf projects
+
+Overleaf's git access can't list an account's projects, so the `list_overleaf_projects` tool uses your Overleaf **web session** instead. It is optional. Without it, everything else keeps working.
+
+1. Log in at www.overleaf.com in your browser.
+2. Open dev tools → **Application** (Chrome) / **Storage** (Firefox) → **Cookies** → `https://www.overleaf.com`, and copy the value of `overleaf_session2`.
+3. Give it to the server in one of these ways (first match wins):
+   - env `OVERLEAF_SESSION_COOKIE=<value>`
+   - env `OVERLEAF_SESSION_COOKIE_FILE=/path/to/file` containing the value
+   - a top-level `"sessionCookie": "<value>"` in `projects.json`
+
+The tool returns each active project's ID, name, access level, and its `projects.json` key if it is configured (`configuredAs`). Archived and trashed projects are not listed. With `sync: true` it also adds the missing projects to `projects.json` under their real names, using your account git token. It never changes entries you already have, except to replace the ID placeholder name left by [project-ID adoption](#using-any-project-id-without-editing-the-config). The write is the same atomic, mode-`600` write.
+
+```
+Use list_overleaf_projects with sync: true
+```
+
+The session cookie **expires**. When it does, the tool says `Overleaf session cookie expired — copy a fresh overleaf_session2 from your browser`. Paste a fresh one; git-based reading and editing are unaffected. The cookie gives full access to your Overleaf account, more than a git token does, so keep it out of synced or shared files. The server never prints it.
+
 ## Getting Overleaf Credentials
 
 1. **Project ID** — open your Overleaf project; the ID is in the URL: `https://www.overleaf.com/project/[PROJECT_ID]`
@@ -260,6 +279,10 @@ Runs the server over stdio against throwaway configs with a fake token. It needs
 ### `list_projects`
 List all configured projects.
 
+### `list_overleaf_projects`
+List all active projects in your Overleaf account (needs the session cookie, see [Listing all your Overleaf projects](#listing-all-your-overleaf-projects)).
+- `sync`: add missing projects to `projects.json` (optional)
+
 ### `list_files`
 List files in a project (default: .tex files).
 - `extension`: File extension filter (optional)
@@ -330,6 +353,7 @@ Use write_section with filePath: "main.tex", sectionTitle: "Introduction", newCo
 - The Overleaf Git token grants full read/write access to your project — treat it like a password.
 - Prefer `OVERLEAF_GIT_TOKEN_FILE` over inlining the token in the Claude Desktop JSON if your config file is backed up or synced.
 - `projects.json` is `.gitignore`d in this repo. Never commit real project IDs or Git tokens.
+- The optional `overleaf_session2` cookie (for `list_overleaf_projects`) grants full access to your Overleaf account. Store it only in a private file (`OVERLEAF_SESSION_COOKIE_FILE`, mode 600) or your private `projects.json`.
 - File paths supplied through MCP tool calls are restricted to the cloned project directory; `..` traversal and absolute paths are rejected.
 
 ## License

@@ -442,6 +442,91 @@ async function adoptProjectId(id) {
   return project;
 }
 
+// ---------------------------------------------------------------------------
+// Account project listing via the Overleaf web session (git can't list projects).
+// Uses GET /user/projects — the route Overleaf's own frontend calls; it returns
+// active projects only ({ _id, name, accessLevel }), archived/trashed filtered server-side.
+// ---------------------------------------------------------------------------
+
+const COOKIE_EXPIRED = 'Overleaf session cookie expired — copy a fresh overleaf_session2 from your browser';
+
+async function readSessionCookie() {
+  let v = process.env.OVERLEAF_SESSION_COOKIE;
+  if (!v && process.env.OVERLEAF_SESSION_COOKIE_FILE) {
+    try {
+      v = await readFile(process.env.OVERLEAF_SESSION_COOKIE_FILE, 'utf-8');
+    } catch {
+      v = null; // unreadable file → treated as "no cookie"
+    }
+  }
+  v = v || projectsConfig.sessionCookie;
+  return v?.trim().replace(/^overleaf_session2=/, '') || null;
+}
+
+async function fetchAccountProjects(cookie) {
+  const res = await fetch('https://www.overleaf.com/user/projects', {
+    headers: { Cookie: `overleaf_session2=${cookie}`, Accept: 'application/json' },
+    redirect: 'manual', // a followed redirect lands on the /login HTML and hides the cause
+  });
+  if ((res.status >= 300 && res.status < 400) || res.status === 401 || res.status === 403) {
+    throw new Error(COOKIE_EXPIRED);
+  }
+  if (!res.ok) throw new Error(`Overleaf project list request failed (HTTP ${res.status})`);
+  let body;
+  try {
+    body = await res.json();
+  } catch {
+    throw new Error(COOKIE_EXPIRED); // HTML instead of JSON: not logged in
+  }
+  if (!Array.isArray(body?.projects)) throw new Error('Unexpected response from Overleaf /user/projects');
+  return body.projects;
+}
+
+async function listOverleafProjects({ sync = false } = {}) {
+  const cookie = await readSessionCookie();
+  if (!cookie) {
+    throw new Error(
+      'No Overleaf session cookie configured. Set OVERLEAF_SESSION_COOKIE (or OVERLEAF_SESSION_COOKIE_FILE, ' +
+        'or a top-level "sessionCookie" in projects.json) to the value of the overleaf_session2 cookie ' +
+        'from a logged-in browser (dev tools → Application → Cookies → www.overleaf.com).'
+    );
+  }
+  let remote;
+  try {
+    remote = await fetchAccountProjects(cookie);
+  } catch (err) {
+    throw new Error(String(err.message).split(cookie).join('***'));
+  }
+  const configured = Object.entries(projectsConfig.projects);
+  const rows = remote.map((p) => ({
+    projectId: p._id,
+    name: p.name,
+    accessLevel: p.accessLevel,
+    configuredAs: configured.find(([, c]) => c.projectId === p._id)?.[0] ?? null,
+  }));
+  if (!sync) return { projects: rows };
+
+  const gitToken = accountToken();
+  if (!gitToken) throw new Error('sync needs at least one configured project with a gitToken');
+  let added = 0;
+  let renamed = 0;
+  for (const row of rows) {
+    if (!row.configuredAs) {
+      projectsConfig.projects[row.projectId] = { name: row.name, projectId: row.projectId, gitToken };
+      row.configuredAs = row.projectId;
+      added++;
+    } else {
+      const entry = projectsConfig.projects[row.configuredAs];
+      if (entry.name === entry.projectId) { // placeholder left by adoptProjectId
+        entry.name = row.name;
+        renamed++;
+      }
+    }
+  }
+  if ((added || renamed) && configPath) await saveConfig();
+  return { projects: rows, added, renamed };
+}
+
 // Helper to get project
 async function getProject(projectName = 'default') {
   const project = projectsConfig.projects[projectName] || (await adoptProjectId(projectName));
@@ -465,6 +550,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: 'object',
           properties: {},
+        },
+      },
+      {
+        name: 'list_overleaf_projects',
+        description:
+          'List all active projects in the Overleaf account (ID, name, access level, and the projects.json ' +
+          'key if configured). Needs an Overleaf session cookie (OVERLEAF_SESSION_COOKIE). ' +
+          'With sync: true, adds missing projects to projects.json under their real names.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            sync: {
+              type: 'boolean',
+              description: 'Add missing projects to projects.json and replace ID placeholder names (optional)',
+            },
+          },
         },
       },
       {
@@ -635,6 +736,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             },
           ],
         };
+      }
+
+      case 'list_overleaf_projects': {
+        const result = await listOverleafProjects(args);
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
       }
 
       case 'list_files': {
