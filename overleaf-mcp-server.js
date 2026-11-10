@@ -7,7 +7,7 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { spawn } from 'child_process';
-import { readFile, writeFile, access, readdir } from 'fs/promises';
+import { readFile, writeFile, access, readdir, chmod, rename } from 'fs/promises';
 import { promisify } from 'util';
 import { exec as execCallback, execFile as execFileCallback } from 'child_process';
 import path from 'path';
@@ -153,6 +153,9 @@ function validateConfigShape(data, sourceLabel) {
   return data;
 }
 
+// Path of the projects.json the config was loaded from; null in env-var mode (nothing to write back).
+let configPath = null;
+
 async function loadProjectsConfig() {
   // 1. Env-var single-project mode wins outright.
   const envId = process.env.OVERLEAF_PROJECT_ID?.trim();
@@ -190,6 +193,7 @@ async function loadProjectsConfig() {
   if (process.env.OVERLEAF_PROJECTS_CONFIG) {
     const p = process.env.OVERLEAF_PROJECTS_CONFIG;
     const data = await loadExplicitConfigOrExit(p, 'OVERLEAF_PROJECTS_CONFIG');
+    configPath = p;
     return validateConfigShape(data, `OVERLEAF_PROJECTS_CONFIG (${p})`);
   }
 
@@ -201,7 +205,10 @@ async function loadProjectsConfig() {
   ];
   for (const c of fallbackCandidates) {
     const data = await tryLoadFile(c.path);
-    if (data) return validateConfigShape(data, `${c.label} (${c.path})`);
+    if (data) {
+      configPath = c.path;
+      return validateConfigShape(data, `${c.label} (${c.path})`);
+    }
   }
 
   // 4. Nothing found — print actionable help and exit.
@@ -402,14 +409,51 @@ const server = new Server(
   }
 );
 
+// Atomic, private write-back of the loaded config: a failed write can't corrupt it.
+async function saveConfig() {
+  const tmp = `${configPath}.tmp`;
+  await writeFile(tmp, JSON.stringify(projectsConfig, null, 2) + '\n', { mode: 0o600 });
+  await chmod(tmp, 0o600); // mode above only applies when tmp is newly created
+  await rename(tmp, configPath);
+}
+
+// Git tokens are account-wide, so any configured project's token works for the account.
+function accountToken() {
+  return Object.values(projectsConfig.projects).find((p) => p.gitToken)?.gitToken;
+}
+
+// Adopt a raw Overleaf project ID (from overleaf.com/project/<id>) that isn't configured yet.
+async function adoptProjectId(id) {
+  if (!/^[0-9a-f]{24}$/.test(id)) return null;
+  const gitToken = accountToken();
+  if (!gitToken) return null;
+  try {
+    await execFileP('git', ['ls-remote', `https://git:${gitToken}@git.overleaf.com/${id}`], {
+      timeout: 30000,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    });
+  } catch {
+    // Fixed text on purpose: git's stderr carries the token URL.
+    throw new Error(`Overleaf project "${id}" is not reachable with the configured git token`);
+  }
+  const project = { name: id, projectId: id, gitToken };
+  projectsConfig.projects[id] = project;
+  if (configPath) await saveConfig();
+  return project;
+}
+
 // Helper to get project
-function getProject(projectName = 'default') {
-  const project = projectsConfig.projects[projectName];
+async function getProject(projectName = 'default') {
+  const project = projectsConfig.projects[projectName] || (await adoptProjectId(projectName));
   if (!project) {
     throw new Error(`Project "${projectName}" not found in configuration`);
   }
   return new OverleafGitClient(project.projectId, project.gitToken);
 }
+
+const PROJECT_NAME_DESCRIPTION =
+  'Project key from list_projects, or any Overleaf project ID (24 hex chars from the project URL); ' +
+  'unknown IDs are verified and added to projects.json (optional, defaults to "default")';
 
 // List all projects
 server.setRequestHandler(ListToolsRequestSchema, async () => {
@@ -431,7 +475,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             projectName: {
               type: 'string',
-              description: 'Project identifier (optional, defaults to "default")',
+              description: PROJECT_NAME_DESCRIPTION,
             },
             extension: {
               type: 'string',
@@ -452,7 +496,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             projectName: {
               type: 'string',
-              description: 'Project identifier (optional)',
+              description: PROJECT_NAME_DESCRIPTION,
             },
           },
           required: ['filePath'],
@@ -470,7 +514,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             projectName: {
               type: 'string',
-              description: 'Project identifier (optional)',
+              description: PROJECT_NAME_DESCRIPTION,
             },
           },
           required: ['filePath'],
@@ -492,7 +536,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             projectName: {
               type: 'string',
-              description: 'Project identifier (optional)',
+              description: PROJECT_NAME_DESCRIPTION,
             },
           },
           required: ['filePath', 'sectionTitle'],
@@ -506,7 +550,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             projectName: {
               type: 'string',
-              description: 'Project identifier (optional)',
+              description: PROJECT_NAME_DESCRIPTION,
             },
           },
         },
@@ -531,7 +575,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             projectName: {
               type: 'string',
-              description: 'Project identifier (optional)',
+              description: PROJECT_NAME_DESCRIPTION,
             },
           },
           required: ['filePath', 'content', 'commitMessage'],
@@ -561,7 +605,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             projectName: {
               type: 'string',
-              description: 'Project identifier (optional)',
+              description: PROJECT_NAME_DESCRIPTION,
             },
           },
           required: ['filePath', 'sectionTitle', 'newContent', 'commitMessage'],
@@ -594,7 +638,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'list_files': {
-        const client = getProject(args.projectName);
+        const client = await getProject(args.projectName);
         const files = await client.listFiles(args.extension || '.tex');
         return {
           content: [
@@ -607,7 +651,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'read_file': {
-        const client = getProject(args.projectName);
+        const client = await getProject(args.projectName);
         const content = await client.readFile(args.filePath);
         return {
           content: [
@@ -620,7 +664,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_sections': {
-        const client = getProject(args.projectName);
+        const client = await getProject(args.projectName);
         const sections = await client.getSections(args.filePath);
         return {
           content: [
@@ -633,7 +677,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'get_section_content': {
-        const client = getProject(args.projectName);
+        const client = await getProject(args.projectName);
         const content = await client.getSectionContent(args.filePath, args.sectionTitle);
         return {
           content: [
@@ -646,7 +690,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'status_summary': {
-        const client = getProject(args.projectName);
+        const client = await getProject(args.projectName);
         const files = await client.listFiles();
         const mainFile = files.find(f => f.includes('main.tex')) || files[0];
         let sections = [];
@@ -671,7 +715,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'write_file': {
-        const client = getProject(args.projectName);
+        const client = await getProject(args.projectName);
         const result = await client.writeFile(args.filePath, args.content, args.commitMessage);
         return {
           content: [
@@ -684,7 +728,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case 'write_section': {
-        const client = getProject(args.projectName);
+        const client = await getProject(args.projectName);
         const result = await client.writeSection(
           args.filePath,
           args.sectionTitle,

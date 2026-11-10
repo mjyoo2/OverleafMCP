@@ -111,6 +111,20 @@ Use read_file with filePath: "main.tex", projectName: "thesis"
 
 If `projectName` is omitted, the `default` entry is used. To put `projects.json` somewhere other than the standard location, point `OVERLEAF_PROJECTS_CONFIG=/absolute/path/projects.json` at it from the `env` block.
 
+### Using any project ID without editing the config
+
+`projectName` also accepts a raw Overleaf project ID: the 24 hex characters from `https://www.overleaf.com/project/<id>`. Git tokens are account-wide, so when the ID isn't configured yet the server:
+
+1. borrows the `gitToken` of a configured project and checks access with `git ls-remote`. If that fails you get `Overleaf project "<id>" is not reachable with the configured git token`, and nothing is saved;
+2. adds the project to the running config so `list_projects` shows it, under the ID as key and name;
+3. saves it to the `projects.json` it loaded at startup. The file is written to a temporary file with mode `600` and then renamed over the original, so a failed write can't corrupt it.
+
+```
+Use list_files with projectName: "6ac22c59a060ff84e1bdb3fd"
+```
+
+In env-var mode (`OVERLEAF_PROJECT_ID` set) the project is kept in memory only; nothing is written to disk. Note that the server rewrites `projects.json` when it adopts a project, so hand edits made while it runs may be overwritten. Edit the file with the server stopped.
+
 ## Getting Overleaf Credentials
 
 1. **Project ID** — open your Overleaf project; the ID is in the URL: `https://www.overleaf.com/project/[PROJECT_ID]`
@@ -232,6 +246,14 @@ OVERLEAF_PROJECT_ID=... OVERLEAF_GIT_TOKEN=... node overleaf-mcp-server.js
 ```
 
 You should see `Overleaf MCP server running on stdio` on stderr. The process stays open waiting for JSON-RPC on stdin; Ctrl+C to exit.
+
+### Tests
+
+```bash
+npm test
+```
+
+Runs the server over stdio against throwaway configs with a fake token. It needs network access to `git.overleaf.com`, but no real credentials.
 
 ## Available Tools
 
